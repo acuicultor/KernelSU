@@ -41,19 +41,13 @@ static int do_get_info(void __user *arg)
 {
     struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
 
-#ifdef MODULE
-    cmd.flags |= KSU_GET_INFO_FLAG_LKM;
+#if defined(MODULE) || defined(CONFIG_KSU_SUSFS)
+    cmd.flags |= 0x1;
 #endif
 
     if (is_manager()) {
-        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
+        cmd.flags |= 0x2;
     }
-    if (ksu_late_loaded) {
-        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;
-    }
-#ifdef EXPECTED_SIZE2
-    cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
-#endif
     cmd.features = KSU_FEATURE_MAX;
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
