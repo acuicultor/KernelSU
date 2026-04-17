@@ -32,26 +32,23 @@ static uint32_t ksuflags_override = 0;
 
 static int do_get_info(void __user *arg)
 {
-	struct ksu_get_info_cmd cmd = {.version = KERNEL_SU_VERSION, .flags = 0};
+    struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
 
-	// NOTE: we do not have LKM support so we don't bother with its flags or late-load
-	if (is_manager()) {
-		cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
-	}
-	cmd.features = KSU_FEATURE_MAX;
+#if defined(MODULE) || defined(CONFIG_KSU_SUSFS)
+    cmd.flags |= 0x1;
+#endif
 
-	if (ksuver_override)
-		cmd.version = ksuver_override;
+    if (is_manager()) {
+        cmd.flags |= 0x2;
+    }
+    cmd.features = KSU_FEATURE_MAX;
 
-	if (ksuflags_override)
-		cmd.flags = ksuflags_override;
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        pr_err("get_version: copy_to_user failed\n");
+        return -EFAULT;
+    }
 
-	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
-		pr_err("get_version: copy_to_user failed\n");
-		return -EFAULT;
-	}
-
-	return 0;
+    return 0;
 }
 
 static int do_report_event(void __user *arg)
