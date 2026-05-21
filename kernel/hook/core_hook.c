@@ -40,6 +40,79 @@ LSM_HANDLER_TYPE ksu_file_permission(struct file *file, int mask)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
+static int (*selinux_bprm_set_creds_fn)(struct linux_binprm *bprm) __read_mostly = NULL;
+static __nocfi int ksu_bprm_set_creds(struct linux_binprm *bprm)
+{
+	if (likely(ksu_boot_completed))
+		goto selinux_fn;
+
+	if (likely(!is_init(current_cred())))
+		goto selinux_fn;
+
+	if (!bprm->filename)
+		goto selinux_fn;
+
+	if (!!strcmp(bprm->filename, "/data/adb/ksud"))
+		goto selinux_fn;
+
+	pr_info("bprm_set_creds: escape init executing %s with pid: %d\n", bprm->filename, current->pid);
+	escape_to_root_forced(); // give this context all permissions
+
+selinux_fn:
+	if (unlikely(!selinux_bprm_set_creds_fn))
+		return 0;
+
+	return selinux_bprm_set_creds_fn(bprm);
+}
+
+static struct security_hook_list ksu_hooks_bprm_set_creds[] __ro_after_init = {
+	LSM_HOOK_INIT(bprm_set_creds, ksu_bprm_set_creds),
+};
+
+static int ksu_restore_bprm_set_creds(void *data)
+{
+	set_user_nice(current, 19); // low prio
+
+loop_start:
+	msleep(5000);
+	if (!*(volatile bool *)&ksu_boot_completed)
+		goto loop_start;
+
+	msleep(1000);
+
+	// now we write back selinux's onto our slot
+	uintptr_t addr = (uintptr_t)&ksu_hooks_bprm_set_creds[0].hook.bprm_set_creds;
+	uintptr_t base = addr & PAGE_MASK;
+	uintptr_t offset = addr & ~PAGE_MASK;
+
+	struct page *page = phys_to_page(__pa(base));
+	if (!page)
+		return 0;
+
+	void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+	if (!writable_addr)
+		return 0;
+
+	void **target_slot = (void **)(writable_addr + offset);
+				
+	preempt_disable();
+	local_irq_disable();
+					
+	WRITE_ONCE(*target_slot, selinux_bprm_set_creds_fn);
+					
+	local_irq_enable();
+	preempt_enable();
+
+	vunmap(writable_addr);
+	smp_mb();
+	
+	pr_info("ksu_bprm_set_creds: restored selinux_bprm_set_creds: *0x%lx = 0x%lx\n", (uintptr_t)addr, *(uintptr_t *)addr);
+
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_KSU_LSM_SECURITY_HOOKS
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
 static struct security_hook_list ksu_hooks[] __ro_after_init = {
@@ -185,6 +258,27 @@ static inline void ksu_security_delete_hooks(struct security_hook_list *hooks, i
 		ksu_hlist_del_safe(&hooks[i].list);
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+static void ksu_dethrone_selinux_bprm_set_creds()
+{
+	struct hlist_head *head = ksu_hooks_bprm_set_creds[0].head; 
+	struct security_hook_list *pos;
+	struct hlist_node *tmp;
+
+	if (!head)
+		return;
+
+	hlist_for_each_entry_safe(pos, tmp, head, list) {
+		// unhook selinux
+		if (!strcmp(pos->lsm, "selinux")) {
+			selinux_bprm_set_creds_fn = pos->hook.bprm_set_creds;
+			pr_info("ksu_bprm_set_creds: selinux_bprm_set_creds found at 0x%lx \n", (uintptr_t)selinux_bprm_set_creds_fn);
+			ksu_hlist_del_safe(&pos->list);
+		}
+	}
+}
+#endif
+
 #else // ! KSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST 
 
 static void ksu_list_del_safe(struct list_head *entry)
@@ -263,6 +357,43 @@ static inline void ksu_security_delete_hooks(struct security_hook_list *hooks, i
 		ksu_list_del_safe(&hooks[i].list);
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+static void ksu_dethrone_selinux_bprm_set_creds()
+{
+	// good thing this is not static
+	extern int cap_bprm_set_creds(struct linux_binprm *bprm);
+
+	struct list_head *head = ksu_hooks_bprm_set_creds[0].head;
+	struct security_hook_list *pos, *tmp;
+
+	if (!head)
+		return;
+
+	if (list_empty(head))
+		return;
+
+	list_for_each_entry_safe(pos, tmp, head, list) {
+		// dont unhook ourself!
+		if (pos->hook.bprm_set_creds == ksu_bprm_set_creds)
+			continue;
+
+		// dont unhook capabilities
+		if (pos->hook.bprm_set_creds == cap_bprm_set_creds)
+			continue;
+
+		if (!selinux_bprm_set_creds_fn && pos->hook.bprm_set_creds) {
+			selinux_bprm_set_creds_fn = pos->hook.bprm_set_creds;
+			pr_info("ksu_bprm_set_creds: found selinux_bprm_set_creds at 0x%lx\n", (uintptr_t)selinux_bprm_set_creds_fn);
+		}
+
+		// just delete evrything
+		pr_info("ksu_bprm_set_creds: delete selinux_bprm_set_creds LSM at 0x%lx\n", (uintptr_t)pos->hook.bprm_set_creds);
+		ksu_list_del_safe(&pos->list);
+	}
+}
+
+#endif
+
 #endif // KSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST
 
 static int ksu_lsm_hook_restore(void *data)
@@ -291,6 +422,12 @@ static __init void ksu_lsm_hook_init(void)
 #if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 	ksu_security_add_hooks(ksu_hooks_file_permission, ARRAY_SIZE(ksu_hooks_file_permission), "ksu_file_permission");
 	kthread_run(ksu_lsm_hook_restore, NULL, "kthread");
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+	ksu_security_add_hooks(ksu_hooks_bprm_set_creds, ARRAY_SIZE(ksu_hooks_bprm_set_creds), "ksu");
+	ksu_dethrone_selinux_bprm_set_creds();
+	kthread_run(ksu_restore_bprm_set_creds, NULL, "kthread");
 #endif
 
 }
