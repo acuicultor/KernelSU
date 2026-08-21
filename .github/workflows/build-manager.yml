@@ -7,6 +7,8 @@ on:
       - '.github/workflows/build-manager.yml'
       - 'manager/**'
       - 'userspace/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
   workflow_call:
   workflow_dispatch:
 
@@ -66,20 +68,36 @@ jobs:
           echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
           echo "Certificate hash: $HASH"
 
+  build-lkm:
+    needs: generate-key
+    uses: ./.github/workflows/build-lkm.yml
+    with:
+      expected_size2: ${{ needs.generate-key.outputs.expected_size || '' }}
+      expected_hash2: ${{ needs.generate-key.outputs.expected_hash || '' }}
+    secrets: inherit
+
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
   build-ksud:
+    needs: [build-lkm, build-ksuinit]
     strategy:
       matrix:
         include:
           - target: aarch64-linux-android
             os: ubuntu-latest
+            pack_lkm: true
+            pack_ksuinit: true
           - target: armv7-linux-androideabi
             os: ubuntu-latest
+            pack_lkm: false
+            pack_ksuinit: false
 
     uses: ./.github/workflows/ksud.yml
     with:
       target: ${{ matrix.target }}
-      pack_lkm: false
-      pack_ksuinit: false
+      pack_lkm: ${{ matrix.pack_lkm }}
+      pack_ksuinit: ${{ matrix.pack_ksuinit }}
 
   build-manager:
     needs: [generate-key]
@@ -91,7 +109,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -161,7 +179,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

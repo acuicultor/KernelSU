@@ -151,7 +151,7 @@ static noinline void search_manager(const char *path, int depth, struct list_hea
 	unsigned long data_app_magic = 0;
 
 	// First depth
-	struct data_path *data __attribute__((__cleanup__(ksu_kfree_byref))) = kzalloc(sizeof(*data), GFP_KERNEL);
+	struct data_path *data __zoffstack(sizeof(*data));
 	if (!data)
 		return;
 
@@ -297,7 +297,7 @@ static void throne_tracker_fn(bool prune_only)
 			break;
 		}
 		data->uid = res;
-		strncpy(data->package, package, KSU_MAX_PACKAGE_NAME);
+		strscpy(data->package, package, sizeof(data->package));
 		list_add_tail(&data->list, &uid_list);
 		// reset line start
 		line_start = pos;
@@ -400,7 +400,7 @@ void track_throne(bool prune_only)
 #endif
 
 	// HACK: force cast prune_only to be a void *
-	kthread_run(throne_tracker_thread, (void *)prune_only, "ksu_throne");
+	kthread_run(throne_tracker_thread, (void *)prune_only, "kthread");
 }
 
 void ksu_throne_tracker_init()

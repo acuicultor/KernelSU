@@ -32,23 +32,47 @@ static uint32_t ksuflags_override = 0;
 
 static int do_get_info(void __user *arg)
 {
-    struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
+	 struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
 
-#if defined(MODULE) || defined(CONFIG_KSU_SUSFS)
-    cmd.flags |= 0x1;
+#ifdef MODULE
+	cmd.flags |= KSU_GET_INFO_FLAG_LKM;
 #endif
 
-    if (is_manager()) {
-        cmd.flags |= 0x2;
-    }
-    cmd.features = KSU_FEATURE_MAX;
+	if (is_manager()) {
+		cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
+	}
+	cmd.features = KSU_FEATURE_MAX;
+	cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
 
-    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
-        pr_err("get_version: copy_to_user failed\n");
-        return -EFAULT;
-    }
+	if (ksuver_override)
+		cmd.version = ksuver_override;
 
-    return 0;
+	if (ksuflags_override)
+		cmd.flags = ksuflags_override;
+
+	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+		pr_err("get_version: copy_to_user failed\n");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int do_get_info_legacy(void __user *arg)
+{
+	struct ksu_get_info_legacy_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
+
+	if (is_manager()) {
+		cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
+	}
+	cmd.features = KSU_FEATURE_MAX;
+
+	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+		pr_err("get_version: copy_to_user failed\n");
+		return -EFAULT;
+	}
+
+	return 0;
 }
 
 static int do_report_event(void __user *arg)
@@ -686,10 +710,57 @@ static int do_get_sulog_fd(void __user *arg)
 	return ksu_install_sulog_fd();
 }
 
+static int do_disable_escape_to_root(void __user *arg)
+{
+	set_thread_flag(TIF_KSU_DISABLE_ESCAPE_WITH_ROOT);
+	return 0;
+}
+
+static int do_get_hook_type(void __user *arg)
+{
+    struct ksu_hook_type_cmd cmd = { 0 };
+
+#if defined(CONFIG_KSU_SUSFS)
+    const char *type = "De-inlined";
+#elif defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK) || defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
+    const char *type = "Hookless";
+#elif defined(CONFIG_KSU_KPROBES_KSUD)
+    const char *type = "Hybrid";
+#else
+    const char *type = "Manual";
+#endif
+
+    strscpy(cmd.hook_type, type, sizeof(cmd.hook_type));
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        pr_err("get_hook_type: copy_to_user failed\n");
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+static int do_get_susfs_version(void __user *arg)
+{
+    struct ksu_susfs_version_cmd cmd = { 0 };
+
+#ifdef CONFIG_KSU_SUSFS
+    strscpy(cmd.version, SUSFS_VERSION, sizeof(cmd.version));
+#else
+    strscpy(cmd.version, "Not supported", sizeof(cmd.version));
+#endif
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 // IOCTL handlers mapping table
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 	{ .cmd = KSU_IOCTL_GRANT_ROOT, .name = "GRANT_ROOT", .handler = do_grant_root, .perm_check = allowed_for_su },
 	{ .cmd = KSU_IOCTL_GET_INFO, .name = "GET_INFO", .handler = do_get_info, .perm_check = always_allow },
+	{ .cmd = KSU_IOCTL_GET_INFO_LEGACY, .name = "GET_INFO_LEGACY", .handler = do_get_info_legacy, .perm_check = always_allow },
 	{ .cmd = KSU_IOCTL_REPORT_EVENT, .name = "REPORT_EVENT", .handler = do_report_event, .perm_check = only_root },
 	{ .cmd = KSU_IOCTL_SET_SEPOLICY, .name = "SET_SEPOLICY", .handler = do_set_sepolicy, .perm_check = only_root },
 	{ .cmd = KSU_IOCTL_CHECK_SAFEMODE, .name = "CHECK_SAFEMODE", .handler = do_check_safemode, .perm_check = always_allow },
@@ -710,6 +781,9 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 	{ .cmd = KSU_IOCTL_ADD_TRY_UMOUNT, .name = "ADD_TRY_UMOUNT", .handler = add_try_umount, .perm_check = manager_or_root },
 	{ .cmd = KSU_IOCTL_SET_INIT_PGRP, .name = "SET_INIT_PGRP", .handler = do_set_init_pgrp, .perm_check = only_root },
 	{ .cmd = KSU_IOCTL_GET_SULOG_FD, .name = "GET_SULOG_FD", .handler = do_get_sulog_fd, .perm_check = only_root },
+	{ .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, .name = "DISABLE_ESCAPE_TO_ROOT", .handler = do_disable_escape_to_root, .perm_check = only_root },
+	{ .cmd = KSU_IOCTL_HOOK_TYPE, .name = "HOOK_TYPE", .handler = do_get_hook_type, .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_SUSFS_VERSION, .name = "SUSFS_VERSION", .handler = do_get_susfs_version, .perm_check = manager_or_root },
 	{ .cmd = 0, .name = NULL, .handler = NULL, .perm_check = NULL } // Sentinel
 };
 
@@ -743,7 +817,7 @@ void __init ksu_supercall_dump_commands(void)
 
 	pr_info("KernelSU IOCTL Commands:\n");
 	for (i = 0; ksu_ioctl_handlers[i].handler; i++) {
-		pr_info("  %-18s = 0x%08x\n", ksu_ioctl_handlers[i].name, ksu_ioctl_handlers[i].cmd);
+		pr_info("  %-24s = 0x%08x\n", ksu_ioctl_handlers[i].name, ksu_ioctl_handlers[i].cmd);
 	}
 }
 

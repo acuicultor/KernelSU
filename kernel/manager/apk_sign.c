@@ -53,26 +53,32 @@ static int ksu_sha256(const unsigned char *data, unsigned int datalen,
 static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
 			unsigned expected_size, const char *expected_sha256)
 {
-	kernel_read(fp, size4, 0x4, pos); // signer-sequence length
-	kernel_read(fp, size4, 0x4, pos); // signer length
-	kernel_read(fp, size4, 0x4, pos); // signed data length
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // signer-sequence length
+		return false;
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // signer length
+		return false;
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // signed data length
+		return false;
 
 	*offset += 0x4 * 3;
 
-	kernel_read(fp, size4, 0x4, pos); // digests-sequence length
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // digests-sequence length
+		return false;
 
 	*pos += *size4;
 	*offset += 0x4 + *size4;
 
-	kernel_read(fp, size4, 0x4, pos); // certificates length
-	kernel_read(fp, size4, 0x4, pos); // certificate length
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // certificates length
+		return false;
+	if (kernel_read(fp, size4, 0x4, pos) != 0x4) // certificate length
+		return false;
 	*offset += 0x4 * 2;
 
 	if (*size4 == expected_size) {
 		*offset += *size4;
 
 #define CERT_MAX_LENGTH 1024
-		char *cert __attribute__((__cleanup__(ksu_kfree_byref))) = kzalloc(CERT_MAX_LENGTH, GFP_KERNEL);
+		char *cert __zoffstack(CERT_MAX_LENGTH);
 		if (!cert)
 			return false;
 
@@ -80,7 +86,10 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
 			pr_info("cert length overlimit\n");
 			return false;
 		}
-		kernel_read(fp, cert, *size4, pos);
+		if (kernel_read(fp, cert, *size4, pos) != *size4) {
+			pr_info("read cert failed\n");
+			return false;
+		}
 		unsigned char digest[SHA256_DIGEST_SIZE];
 		if (ksu_sha256(cert, *size4, digest) < 0 ) {
 			pr_info("sha256 error\n");
@@ -216,17 +225,25 @@ static __always_inline bool check_v2_signature(char *path,
 
 	pos += 12;
 	// offset
-	kernel_read(fp, &size4, 0x4, &pos);
+	if (kernel_read(fp, &size4, 0x4, &pos) != 0x4) {
+		goto clean;
+	}
 	pos = size4 - 0x18;
 
-	kernel_read(fp, &size8, 0x8, &pos);
-	kernel_read(fp, buffer, 0x10, &pos);
-	if (memcmp(buffer, "APK Sig Block 42", 16)) {
+	if (kernel_read(fp, &size8, 0x8, &pos) != 0x8) {
+		goto clean;
+	}
+	if (kernel_read(fp, buffer, 0x10, &pos) != 0x10) {
+		goto clean;
+	}
+	if (strcmp((char *)buffer, "APK Sig Block 42")) {
 		goto clean;
 	}
 
 	pos = size4 - (size8 + 0x8);
-	kernel_read(fp, &size_of_block, 0x8, &pos);
+	if (kernel_read(fp, &size_of_block, 0x8, &pos) != 0x8) {
+		goto clean;
+	}
 	if (size_of_block != size8) {
 		goto clean;
 	}
@@ -235,11 +252,17 @@ static __always_inline bool check_v2_signature(char *path,
 	while (loop_count++ < 10) {
 		uint32_t id;
 		uint32_t offset;
-		kernel_read(fp, &size8, 0x8, &pos); // sequence length
+		if (kernel_read(fp, &size8, 0x8, &pos) != 0x8) { // sequence length
+			v2_signing_valid = false;
+			goto clean;
+		}
 		if (size8 == size_of_block) {
 			break;
 		}
-		kernel_read(fp, &id, 0x4, &pos); // id
+		if (kernel_read(fp, &id, 0x4, &pos) != 0x4) { // id
+			v2_signing_valid = false;
+			goto clean;
+		}
 		offset = 4;
 		if (id == 0x7109871au) {
 			v2_signing_blocks++;
@@ -344,7 +367,7 @@ int get_pkg_from_apk_path(char *pkg, const char *path)
 		return -1;
 
 	// Copying the package name
-	strncpy(pkg, second_last_slash + 1, pkg_len);
+	memcpy(pkg, second_last_slash + 1, pkg_len);
 	pkg[pkg_len] = '\0';
 
 	return 0;
@@ -368,7 +391,5 @@ bool is_manager_apk(char *path)
 	return (check_v2_signature(path, 0x363, "4359c171f32543394cbc23ef908c4bb94cad7c8087002ba164c8230948c21549") // dummy.keystore
 	|| check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH)  // kernelsu official
 	|| check_v2_signature(path, 0x375, "484fcba6e6c43b1fb09700633bf2fb4758f13cb0b2f4457b80d075084b26c588")  // KOWX712/KernelSU
-	|| check_v2_signature(path, 0x3e6, "79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7")  // rifsxd/KernelSU-Next
-	|| check_v2_signature(path, 0x396, "f415f4ed9435427e1fdf7f1fccd4dbc07b3d6b8751e4dbcec6f19671f427870b")  // rsuntk/KernelSU
 	);
 }

@@ -1,4 +1,4 @@
-#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#if defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE) || defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
 #define SUCOMPAT_HOOK_TYPE static __always_inline int
 #else
 #define SUCOMPAT_HOOK_TYPE int
@@ -78,7 +78,11 @@ static inline void ksu_sucompat_enable_branch() { } // no-op
 static inline void ksu_sucompat_disable_branch() { } // no-op
 #endif
 
-__attribute__((hot))
+static noinline bool __ksu_is_allow_uid_copy(uid_t uid)
+{
+	return __ksu_is_allow_uid(uid);
+}
+
 static __always_inline bool is_su_allowed(const void **ptr_to_check)
 {
 #ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
@@ -92,6 +96,7 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 #endif // KSU_CAN_USE_JUMP_LABEL
 #endif
 
+	// put ret hot on insn pipeline
 	if (likely(test_thread_flag(TIF_SECCOMP)))
 		return false;
 
@@ -112,8 +117,11 @@ uid_check:
 	if (likely(uid != 2000))
 		goto check_ptr;
 
-	// use internal function, not the macro
-	if (!__ksu_is_allow_uid(uid))
+	// use our noinline copy.
+	// only shell falls through this. 
+	// nbd that it opens up a stack frame
+	// having small code around here is worth
+	if (!__ksu_is_allow_uid_copy(uid))
 		return false;
 
 check_ptr:
@@ -134,18 +142,20 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 				const uint8_t sym)
 {
 	uintptr_t buf;
-	const char su[] = SU_PATH;
+	const char su[16] = SU_PATH;
 
 	// sugar prep
 	uintptr_t *su_p = (uintptr_t *)su;
-	uintptr_t __user *fn_p = (uintptr_t *)untagged_addr(*(char **)filename_user);
+	uintptr_t __user *fn_p = (uintptr_t __user *)untagged_addr(*(char **)filename_user);
+
+	// cheaper than prefaulting (fault_in_readable, fault_in_pages_readable)
+	__builtin_prefetch(fn_p);
 
 	// assert /system/bin/su\0 = 15 bytes.
-	BUILD_BUG_ON(sizeof(su) > 16); // compielr might to pad
-	BUILD_BUG_ON(sizeof(su) < 15);
+	BUILD_BUG_ON(sizeof(SU_PATH) + 1 != 16);
 
 	/*
-	 * it seems this is actually the slowest part, we peek last word first to speed it up
+	 * it seems this is actually the slowest part, so we peek last word first to speed it up
 	 * NOTE: get_user rets EFAULT on err, so if we are copying a pointer
 	 * that goes to nothing, we also detect that and ret fast
 	 *
@@ -153,10 +163,7 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 	 * but this is fine as we are guaranteed alignment, hardware provides trailing garbeg
 	 * if it is specially crafted and hits a page guard, we just get EFAULT anyway
 	 *
-	 * on 64-bit we do this in 2 word compare, 4 on 32-bit
-	 *
-	 * we can do some bitmasking 0xFFFFFF blah blah to do that tail compare (7 or 3 bytes), 
-	 * but hot damn I hate that shit, lets just have __builtin_memcmp do it for us
+	 * on 64-bit we do this in 2 word compare, 4 on 32-bit, little endian only!
 	 *
 	 */
 
@@ -164,13 +171,14 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 	if (get_user(buf, &fn_p[1]))
 		return;
 
-	if (likely(!!__builtin_memcmp(&buf, su + sizeof(uintptr_t), sizeof(su) - sizeof(uintptr_t) )))
+	if (likely((buf & 0x00FFFFFFFFFFFFFFUL) != (su_p[1] & 0x00FFFFFFFFFFFFFFUL)))
 		return;
+
 #else
 	if (get_user(buf, &fn_p[3]))
 		return;
 
-	if (likely(!!__builtin_memcmp(&buf, su +  (3 * sizeof(uintptr_t)), sizeof(su) - (3 * sizeof(uintptr_t)) )))
+	if (likely((buf & 0x00FFFFFFUL) != (su_p[3] & 0x00FFFFFFUL)))
 		return;
 
 	if (unlikely(get_user(buf, &fn_p[2])))
@@ -256,8 +264,7 @@ SUCOMPAT_HOOK_TYPE ksu_handle_execve(const char __user **filename_user, void *ar
 	return 0;
 }
 
-#ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
-static __always_inline void ksu_sucompat_kernel_common(void **filename_ptr, void *argv, void *envp, const char *function_name)
+static __always_inline void ksu_sucompat_kernel_common(void **restrict filename_ptr, void *restrict argv, void *restrict envp, const char *function_name)
 {
 
 #ifdef CONFIG_KSU_FEATURE_ADBROOT
@@ -269,20 +276,16 @@ static __always_inline void ksu_sucompat_kernel_common(void **filename_ptr, void
 
 	// it seems this is actually the slowest part, we peek last word first to speed it up
 	// sugar prep
-	const char su[] = SU_PATH;
+	const char su[16] = SU_PATH;
 	uintptr_t *su_p = (uintptr_t *)su;
 	uintptr_t *fn_p = (uintptr_t *)*(char **)filename_ptr;
 
-	// assert /system/bin/su\0 = 15 bytes.
-	BUILD_BUG_ON(sizeof(su) > 16); // compielr might to pad
-	BUILD_BUG_ON(sizeof(su) < 15);
-
 	// getname_flags pads this so nothing to worry about, dereference with confidence!
 #ifdef CONFIG_64BIT
-	if (likely(!!__builtin_memcmp(&fn_p[1], &su_p[1], sizeof(su) - sizeof(uintptr_t) )))
+	if (likely((fn_p[1] & 0x00FFFFFFFFFFFFFFUL) != (su_p[1] & 0x00FFFFFFFFFFFFFFUL)))
 		return;
 #else
-	if (likely(!!__builtin_memcmp(&fn_p[3], &su_p[3], sizeof(su) - (3 * sizeof(uintptr_t)) )))
+	if (likely((fn_p[3] & 0x00FFFFFFUL) != (su_p[3] & 0x00FFFFFFUL)))
 		return;
 
 	if (fn_p[2] != su_p[2])
@@ -322,7 +325,7 @@ no_ksud:
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 // take note: struct filename **filename, for do_execveat_common / do_execve_common on >= 3.14
-int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
+SUCOMPAT_HOOK_TYPE ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
 {
 	struct filename *filename = *filename_ptr;
 	if (IS_ERR(filename)) // see getname_flags
@@ -333,20 +336,19 @@ int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, voi
 }
 #else
 // take note: char **filename, for do_execve_common on < 3.14
-int ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
+SUCOMPAT_HOOK_TYPE ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
 {
 	ksu_sucompat_kernel_common((void **)filename_ptr, argv, envp, "do_execve_common");
 	return 0;
 }
 #endif
-#endif // CONFIG_KSU_TAMPER_SYSCALL_TABLE
 
 #ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
 static void syscall_table_sucompat_enable();
 static void syscall_table_sucompat_disable();
 #else
-static inline void syscall_table_sucompat_enable() { } // no-op
-static inline void syscall_table_sucompat_disable() { } // no-op
+#define syscall_table_sucompat_enable() do { } while (0)
+#define syscall_table_sucompat_disable() do { } while (0)
 #endif
 
 static void ksu_sucompat_enable()
